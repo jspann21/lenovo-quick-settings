@@ -1,0 +1,28 @@
+# Build output
+LenovoQuickSettings/dist/
+**/bin/
+**/obj/
+*.pdb
+
+# Visual Studio and editor state
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak
+*.cache
+
+# Windows and macOS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local Codex workspace metadata
+.agents/
+.codex/

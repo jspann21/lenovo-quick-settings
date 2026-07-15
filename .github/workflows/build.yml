@@ -1,0 +1,42 @@
+name: Build Windows executable
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build executable
+        shell: powershell
+        run: .\LenovoQuickSettings\build.ps1
+
+      - name: Verify build output
+        shell: powershell
+        run: |
+          $exe = '.\LenovoQuickSettings\dist\LenovoQuickSettings.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Build output was not created at $exe"
+          }
+          Get-Item -LiteralPath $exe | Format-List Name, Length, LastWriteTimeUtc
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: LenovoQuickSettings-windows-x64
+          path: LenovoQuickSettings/dist/LenovoQuickSettings.exe
+          if-no-files-found: error
+          retention-days: 30
