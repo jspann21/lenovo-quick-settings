@@ -52,6 +52,20 @@ LenovoQuickSettings\dist\LenovoQuickSettings.exe
 
 No Lenovo binaries are copied into the repository or bundled into the executable. Lenovo's installed Vantage add-ins are discovered at runtime.
 
+Hardware requests run serially on a background STA thread so the panel and tray remain responsive. If Lenovo controls are unavailable, use **Refresh** in the tray menu to retry; Windows startup settings remain accessible. Failed changes are read back before hardware controls are re-enabled.
+
+## Diagnostics
+
+To write a hardware status report without changing settings:
+
+```powershell
+Start-Process .\LenovoQuickSettings\dist\LenovoQuickSettings.exe -ArgumentList '--status-file "C:\Temp\lenovo-status.txt"' -Wait
+```
+
+The output directory must already exist. Relative report paths are resolved against the launching process's working directory before Lenovo's agents load. An invalid output path returns exit code 1 before contacting the hardware.
+
+The optional `--verification-cycle "C:\Temp\lenovo-cycle.txt"` command temporarily changes power and conservation settings, then attempts to restore the original power mode and exact charging mode, including Quick charging. Each setting it attempted to change is restored independently. Check the report and exit code: a failed restoration can leave a setting changed, and verification, restoration, or controller cleanup failures return exit code 1.
+
 ## Install
 
 After building, run:

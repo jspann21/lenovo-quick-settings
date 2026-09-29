@@ -6,24 +6,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $project 'deployment.ps1')
 $source = Join-Path $project 'dist\LenovoQuickSettings.exe'
-$installDirectory = Join-Path $env:LOCALAPPDATA 'LenovoQuickSettings'
+$installDirectory = Get-LenovoInstallDirectory
 $target = Join-Path $installDirectory 'LenovoQuickSettings.exe'
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Lenovo Quick Settings.lnk'
 $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Lenovo Quick Settings.lnk'
 
-if (-not (Test-Path $source)) {
+if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
     & (Join-Path $project 'build.ps1')
 }
 
-Get-Process -Name 'LenovoQuickSettings' -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
+Stop-LenovoInstalledApp -ExecutablePath $target
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 Copy-Item -LiteralPath $source -Destination $target -Force
 
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if ($NoStartup) {
-    Remove-ItemProperty -Path $runKey -Name 'Lenovo Quick Settings' -ErrorAction SilentlyContinue
+    Remove-LenovoStartupEntry
 } else {
     New-Item -Path $runKey -Force | Out-Null
     Set-ItemProperty -Path $runKey -Name 'Lenovo Quick Settings' -Value ('"' + $target + '" --tray') -Type String

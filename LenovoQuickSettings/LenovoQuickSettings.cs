@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -8,6 +9,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace LenovoQuickSettings
@@ -19,15 +21,79 @@ namespace LenovoQuickSettings
         Performance
     }
 
+    internal enum LenovoChargeMode
+    {
+        Normal,
+        Quick,
+        Storage
+    }
+
     internal sealed class LenovoState
     {
         public LenovoPowerMode PowerMode { get; set; }
-        public bool ConservationMode { get; set; }
+        public LenovoChargeMode ChargeMode { get; set; }
+        public bool ConservationMode { get { return ChargeMode == LenovoChargeMode.Storage; } }
         public bool ZeroTouchLogin { get; set; }
         public bool ZeroTouchLock { get; set; }
     }
 
-    internal sealed class LenovoController
+    // Keep Lenovo agents on one STA thread and keep driver waits off the UI thread.
+    internal sealed class ControllerWorker : IDisposable
+    {
+        private readonly BlockingCollection<Action> operations = new BlockingCollection<Action>();
+        private readonly object syncRoot = new object();
+        private readonly Thread thread;
+        private bool disposed;
+
+        public ControllerWorker()
+        {
+            thread = new Thread(delegate()
+            {
+                try
+                {
+                    foreach (Action operation in operations.GetConsumingEnumerable()) operation();
+                }
+                finally
+                {
+                    operations.Dispose();
+                }
+            });
+            thread.IsBackground = true;
+            thread.Name = "Lenovo controller";
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+        }
+
+        public Task<T> Run<T>(Func<T> operation)
+        {
+            TaskCompletionSource<T> completion = new TaskCompletionSource<T>();
+            lock (syncRoot)
+            {
+                if (disposed) throw new ObjectDisposedException("ControllerWorker");
+                operations.Add(delegate
+                {
+                    try { completion.SetResult(operation()); }
+                    catch (Exception ex) { completion.SetException(ex); }
+                });
+            }
+            return completion.Task;
+        }
+
+        public void Dispose()
+        {
+            lock (syncRoot)
+            {
+                if (disposed) return;
+                disposed = true;
+                operations.CompleteAdding();
+            }
+            // Drain queued cleanup before the process exits, but do not hang shutdown
+            // indefinitely if a Lenovo native call stops responding.
+            thread.Join(5000);
+        }
+    }
+
+    internal sealed class LenovoController : IDisposable
     {
         private readonly object syncRoot = new object();
         private readonly string addinDirectory;
@@ -37,6 +103,7 @@ namespace LenovoQuickSettings
         private readonly object powerAgent;
         private readonly object batteryAgent;
         private readonly object presenceAgent;
+        private bool disposed;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool SetDllDirectory(string lpPathName);
@@ -59,30 +126,38 @@ namespace LenovoQuickSettings
                 new[] { "Lenovo.Vantage.SmartSenseRpcClient.dll", "SmartSenseRpcClient.dll" }
             );
             AppDomain.CurrentDomain.AssemblyResolve += ResolveVendorAssembly;
-
-            UseVendorDirectory(addinDirectory);
-
-            powerContract = Assembly.LoadFrom(Path.Combine(addinDirectory, "PowerContract.dll"));
-            batteryContract = Assembly.LoadFrom(Path.Combine(addinDirectory, "BatteryManagementContract.dll"));
-
-            Assembly powerAgentAssembly = Assembly.LoadFrom(Path.Combine(addinDirectory, "IdeaPowerAgent.dll"));
-            Assembly batteryAgentAssembly = Assembly.LoadFrom(Path.Combine(addinDirectory, "IdeaBatteryAgent.dll"));
-
-            powerAgent = GetSingleton(powerAgentAssembly, "IdeaNotebookAddin.PowerAgent");
-            batteryAgent = GetSingleton(batteryAgentAssembly, "IdeaNotebookAddin.BatteryAgent");
-
-            UseVendorDirectory(presenceAddinDirectory);
-            Assembly presenceAssembly = Assembly.LoadFrom(
-                Path.Combine(presenceAddinDirectory, "Lenovo.Vantage.SmartSenseRpcClient.dll")
-            );
-            Type presenceType = presenceAssembly.GetType("SmartSenseHsaRpcClient.HumanPresenceDetection", true);
-            presenceAgent = Activator.CreateInstance(presenceType);
-
-            long capabilities = Convert.ToInt64(GetProperty(presenceAgent, "Capability"));
-            const long requiredCapabilities = 2L | 16L;
-            if ((capabilities & requiredCapabilities) != requiredCapabilities)
+            try
             {
-                throw new NotSupportedException("This Lenovo presence sensor does not expose both approach and leave detection.");
+                UseVendorDirectory(addinDirectory);
+
+                powerContract = Assembly.LoadFrom(Path.Combine(addinDirectory, "PowerContract.dll"));
+                batteryContract = Assembly.LoadFrom(Path.Combine(addinDirectory, "BatteryManagementContract.dll"));
+
+                Assembly powerAgentAssembly = Assembly.LoadFrom(Path.Combine(addinDirectory, "IdeaPowerAgent.dll"));
+                Assembly batteryAgentAssembly = Assembly.LoadFrom(Path.Combine(addinDirectory, "IdeaBatteryAgent.dll"));
+
+                powerAgent = GetSingleton(powerAgentAssembly, "IdeaNotebookAddin.PowerAgent");
+                batteryAgent = GetSingleton(batteryAgentAssembly, "IdeaNotebookAddin.BatteryAgent");
+
+                UseVendorDirectory(presenceAddinDirectory);
+                Assembly presenceAssembly = Assembly.LoadFrom(
+                    Path.Combine(presenceAddinDirectory, "Lenovo.Vantage.SmartSenseRpcClient.dll")
+                );
+                Type presenceType = presenceAssembly.GetType("SmartSenseHsaRpcClient.HumanPresenceDetection", true);
+                presenceAgent = Activator.CreateInstance(presenceType);
+
+                long capabilities = Convert.ToInt64(GetProperty(presenceAgent, "Capability"));
+                const long requiredCapabilities = 2L | 16L;
+                if ((capabilities & requiredCapabilities) != requiredCapabilities)
+                {
+                    throw new NotSupportedException("This Lenovo presence sensor does not expose both approach and leave detection.");
+                }
+            }
+            catch
+            {
+                // Keep the initialization failure if native cleanup also fails.
+                try { Dispose(); } catch { }
+                throw;
             }
         }
 
@@ -97,14 +172,14 @@ namespace LenovoQuickSettings
             {
                 UseVendorDirectory(addinDirectory);
                 LenovoPowerMode powerMode = ReadPowerMode();
-                bool conservationMode = ReadConservationMode();
+                LenovoChargeMode chargeMode = ReadChargeMode();
 
                 UseVendorDirectory(presenceAddinDirectory);
                 object presence = ReadPresenceSettings();
                 return new LenovoState
                 {
                     PowerMode = powerMode,
-                    ConservationMode = conservationMode,
+                    ChargeMode = chargeMode,
                     ZeroTouchLogin = GetBooleanField(presence, "ApproachEnabled"),
                     ZeroTouchLock = GetBooleanField(presence, "PresenceLeaveEnabled")
                 };
@@ -138,18 +213,24 @@ namespace LenovoQuickSettings
 
         public void SetConservationMode(bool enabled)
         {
+            SetChargeMode(enabled ? LenovoChargeMode.Storage : LenovoChargeMode.Normal);
+        }
+
+        public void SetChargeMode(LenovoChargeMode mode)
+        {
+            if (!Enum.IsDefined(typeof(LenovoChargeMode), mode)) throw new ArgumentOutOfRangeException("mode");
             lock (syncRoot)
             {
                 UseVendorDirectory(addinDirectory);
                 Type requestType = batteryContract.GetType("Lenovo.Modern.Contracts.BatteryManagement.BatteryMgmtRequest", true);
                 Type enumType = batteryContract.GetType("Lenovo.Modern.Contracts.BatteryManagement.BatteryChargeModeType", true);
                 object request = Activator.CreateInstance(requestType);
-                string vendorMode = enabled ? "Storage" : "Normal";
+                string vendorMode = mode.ToString();
                 requestType.GetProperty("BatteryChargeMode").SetValue(request, Enum.Parse(enumType, vendorMode), null);
 
                 Invoke(batteryAgent, "SetBatteryChargeMode", request);
                 Verify(
-                    delegate { return ReadConservationMode() == enabled; },
+                    delegate { return ReadChargeMode() == mode; },
                     "Lenovo accepted the charging request, but the battery controller did not report the new mode."
                 );
             }
@@ -208,7 +289,7 @@ namespace LenovoQuickSettings
             throw new InvalidOperationException("Unsupported Lenovo power mode: " + name);
         }
 
-        private bool ReadConservationMode()
+        private LenovoChargeMode ReadChargeMode()
         {
             object response = Invoke(batteryAgent, "GetBatteryChargeMode");
             object value = GetProperty(response, "BatteryChargeMode");
@@ -218,8 +299,9 @@ namespace LenovoQuickSettings
             }
 
             string name = value.ToString();
-            if (name == "Storage") return true;
-            if (name == "Normal" || name == "Quick") return false;
+            if (name == "Storage") return LenovoChargeMode.Storage;
+            if (name == "Normal") return LenovoChargeMode.Normal;
+            if (name == "Quick") return LenovoChargeMode.Quick;
             throw new InvalidOperationException("Unsupported Lenovo charging mode: " + name);
         }
 
@@ -354,6 +436,25 @@ namespace LenovoQuickSettings
         {
             Version version;
             return Version.TryParse(text, out version) ? version : new Version(0, 0);
+        }
+
+        public void Dispose()
+        {
+            lock (syncRoot)
+            {
+                if (disposed) return;
+                disposed = true;
+                try
+                {
+                    // The presence client is owned by this controller; the other agents are shared singletons.
+                    IDisposable presenceClient = presenceAgent as IDisposable;
+                    if (presenceClient != null) presenceClient.Dispose();
+                }
+                finally
+                {
+                    AppDomain.CurrentDomain.AssemblyResolve -= ResolveVendorAssembly;
+                }
+            }
         }
     }
 
@@ -549,7 +650,8 @@ namespace LenovoQuickSettings
 
     internal sealed class MainForm : Form
     {
-        private readonly LenovoController controller;
+        private LenovoController controller;
+        private readonly ControllerWorker controllerWorker = new ControllerWorker();
         private readonly bool startHidden;
         private readonly Button autoButton;
         private readonly Button saverButton;
@@ -559,7 +661,10 @@ namespace LenovoQuickSettings
         private readonly ToggleSwitch zeroTouchLockCheckBox;
         private readonly ToggleSwitch startupCheckBox;
         private readonly Label statusLabel;
+        private readonly Label connectionLabel;
         private readonly NotifyIcon trayIcon;
+        private readonly ContextMenuStrip trayMenu;
+        private readonly Icon appIcon;
         private readonly ToolStripMenuItem trayAuto;
         private readonly ToolStripMenuItem traySaver;
         private readonly ToolStripMenuItem trayPerformance;
@@ -567,6 +672,8 @@ namespace LenovoQuickSettings
         private readonly ToolStripMenuItem trayZeroTouchLogin;
         private readonly ToolStripMenuItem trayZeroTouchLock;
         private readonly ToolStripMenuItem trayStartup;
+        private readonly ToolStripItem trayRefresh;
+        private bool hardwareAvailable;
         private bool updating;
         private bool exiting;
         private bool balloonShown;
@@ -601,7 +708,8 @@ namespace LenovoQuickSettings
             BackColor = Background;
             ForeColor = Color.White;
             Font = new Font("Segoe UI", 9F);
-            Icon = CreateAppIcon();
+            appIcon = CreateAppIcon();
+            Icon = appIcon;
             ShowInTaskbar = false;
             if (startHidden)
             {
@@ -636,13 +744,13 @@ namespace LenovoQuickSettings
             model.MouseDown += DragWindow;
             titleBar.Controls.Add(model);
 
-            Label connected = new Label();
-            connected.Text = "●  CONNECTED";
-            connected.Font = new Font("Segoe UI Semibold", 7F);
-            connected.ForeColor = Color.FromArgb(91, 210, 145);
-            connected.Location = new Point(254, 19);
-            connected.AutoSize = true;
-            titleBar.Controls.Add(connected);
+            connectionLabel = new Label();
+            connectionLabel.Text = "●  CONNECTING";
+            connectionLabel.Font = new Font("Segoe UI Semibold", 7F);
+            connectionLabel.ForeColor = Muted;
+            connectionLabel.Location = new Point(254, 19);
+            connectionLabel.AutoSize = true;
+            titleBar.Controls.Add(connectionLabel);
 
             Button hideButton = CreateWindowButton("—", 356);
             hideButton.Click += delegate { HideToTray(); };
@@ -725,7 +833,7 @@ namespace LenovoQuickSettings
             ToolStripMenuItem powerMenu = new ToolStripMenuItem("Power mode");
             powerMenu.DropDownItems.AddRange(new ToolStripItem[] { trayAuto, traySaver, trayPerformance });
 
-            ContextMenuStrip trayMenu = new ContextMenuStrip();
+            trayMenu = new ContextMenuStrip();
             trayMenu.BackColor = Color.FromArgb(19, 21, 25);
             trayMenu.ForeColor = Color.White;
             trayMenu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
@@ -739,7 +847,7 @@ namespace LenovoQuickSettings
             trayMenu.Items.Add(trayZeroTouchLock);
             trayMenu.Items.Add(trayStartup);
             trayMenu.Items.Add(new ToolStripSeparator());
-            trayMenu.Items.Add("Refresh", null, delegate { RefreshState(true); });
+            trayRefresh = trayMenu.Items.Add("Refresh", null, delegate { RefreshState(true); });
             trayMenu.Items.Add("Exit", null, delegate { ExitApplication(); });
 
             trayIcon = new NotifyIcon();
@@ -763,10 +871,10 @@ namespace LenovoQuickSettings
             Shown += delegate
             {
                 PositionNearTaskbar();
-                RefreshState(false);
+                RefreshState(!this.startHidden);
                 if (this.startHidden)
                 {
-                    BeginInvoke((MethodInvoker)delegate { HideToTray(); });
+                    if (WindowState == FormWindowState.Minimized) HideToTray();
                 }
                 else
                 {
@@ -777,19 +885,8 @@ namespace LenovoQuickSettings
                 }
             };
 
-            try
-            {
-                controller = new LenovoController();
-            }
-            catch (Exception ex)
-            {
-                SetControlsEnabled(false);
-                statusLabel.Text = "Lenovo control unavailable";
-                if (!startHidden)
-                {
-                    MessageBox.Show(this, ex.Message, "Lenovo Quick Settings", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
+            SetControlsEnabled(true);
+            RefreshStartupState();
         }
 
         private Button CreateModeButton(string text, LenovoPowerMode mode, int left)
@@ -938,6 +1035,25 @@ namespace LenovoQuickSettings
             DwmSetWindowAttribute(Handle, 33, ref roundedCorners, sizeof(int));
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !IsDisposed)
+            {
+                exiting = true;
+                controllerWorker.Run(delegate
+                {
+                    try { if (controller != null) controller.Dispose(); }
+                    catch (Exception ex) { Debug.WriteLine("Lenovo controller cleanup failed: " + ex); }
+                    return true;
+                });
+                controllerWorker.Dispose();
+                if (trayIcon != null) trayIcon.Dispose();
+                if (trayMenu != null) trayMenu.Dispose();
+                if (appIcon != null) appIcon.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -951,63 +1067,14 @@ namespace LenovoQuickSettings
 
         private void RefreshState(bool showErrors)
         {
-            if (controller == null || updating) return;
-            try
-            {
-                updating = true;
-                SetControlsEnabled(false);
-                statusLabel.Text = "Reading Lenovo controller...";
-                Application.DoEvents();
-
-                LenovoState state = controller.GetState();
-                UpdateModeButtons(state.PowerMode);
-                conservationCheckBox.Checked = state.ConservationMode;
-                trayConservation.Checked = state.ConservationMode;
-                zeroTouchLoginCheckBox.Checked = state.ZeroTouchLogin;
-                trayZeroTouchLogin.Checked = state.ZeroTouchLogin;
-                zeroTouchLockCheckBox.Checked = state.ZeroTouchLock;
-                trayZeroTouchLock.Checked = state.ZeroTouchLock;
-                bool startupEnabled = StartupManager.IsEnabled();
-                startupCheckBox.Checked = startupEnabled;
-                trayStartup.Checked = startupEnabled;
-                statusLabel.Text = "●  HARDWARE STATE VERIFIED";
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text = "Read failed";
-                if (showErrors) ShowError(ex);
-            }
-            finally
-            {
-                SetControlsEnabled(true);
-                updating = false;
-            }
+            RunHardwareOperation(null, null, "Reading Lenovo controller...", "●  HARDWARE STATE VERIFIED", showErrors);
         }
 
         private void ApplyPowerMode(LenovoPowerMode mode)
         {
-            if (controller == null || updating) return;
-            try
-            {
-                updating = true;
-                SetControlsEnabled(false);
-                statusLabel.Text = "Applying " + DisplayName(mode) + "...";
-                Application.DoEvents();
-                controller.SetPowerMode(mode);
-                UpdateModeButtons(mode);
-                statusLabel.Text = DisplayName(mode) + " verified";
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text = "Change failed";
-                ShowError(ex);
-                RefreshState(false);
-            }
-            finally
-            {
-                SetControlsEnabled(true);
-                updating = false;
-            }
+            RunHardwareOperation(delegate { controller.SetPowerMode(mode); },
+                delegate { UpdateModeButtons(mode); },
+                "Applying " + DisplayName(mode) + "...", DisplayName(mode) + " verified", true);
         }
 
         private void ConservationChanged(object sender, EventArgs args)
@@ -1030,9 +1097,30 @@ namespace LenovoQuickSettings
             if (!updating) ApplyZeroTouchLock(zeroTouchLockCheckBox.Checked);
         }
 
+        private void RefreshStartupState()
+        {
+            try
+            {
+                bool enabled = StartupManager.IsEnabled();
+                // Programmatic toggle updates must not write back to the registry.
+                bool wasUpdating = updating;
+                updating = true;
+                try
+                {
+                    startupCheckBox.Checked = enabled;
+                    trayStartup.Checked = enabled;
+                }
+                finally { updating = wasUpdating; }
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "Startup state unavailable: " + ex.Message;
+            }
+        }
+
         private void ApplyStartup(bool enabled)
         {
-            if (updating) return;
+            if (updating || exiting) return;
             try
             {
                 updating = true;
@@ -1043,99 +1131,121 @@ namespace LenovoQuickSettings
             }
             catch (Exception ex)
             {
-                bool actual = StartupManager.IsEnabled();
-                startupCheckBox.Checked = actual;
-                trayStartup.Checked = actual;
+                RefreshStartupState();
                 ShowError(ex);
             }
-            finally
-            {
-                updating = false;
-            }
+            finally { updating = false; }
         }
 
         private void ApplyConservation(bool enabled)
         {
-            if (controller == null || updating) return;
-            try
-            {
-                updating = true;
-                SetControlsEnabled(false);
-                statusLabel.Text = "Updating charging mode...";
-                Application.DoEvents();
-                controller.SetConservationMode(enabled);
-                conservationCheckBox.Checked = enabled;
-                trayConservation.Checked = enabled;
-                statusLabel.Text = enabled ? "Conservation verified" : "Normal charging verified";
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text = "Change failed";
-                ShowError(ex);
-                RefreshState(false);
-            }
-            finally
-            {
-                SetControlsEnabled(true);
-                updating = false;
-            }
+            RunHardwareOperation(delegate { controller.SetConservationMode(enabled); },
+                delegate
+                {
+                    conservationCheckBox.Checked = enabled;
+                    trayConservation.Checked = enabled;
+                },
+                "Updating charging mode...", enabled ? "Conservation verified" : "Normal charging verified", true);
         }
 
         private void ApplyZeroTouchLogin(bool enabled)
         {
-            ApplyPresenceSetting(
-                enabled,
-                "Updating zero-touch login...",
-                delegate { controller.SetZeroTouchLogin(enabled); },
-                zeroTouchLoginCheckBox,
-                trayZeroTouchLogin,
-                enabled ? "Zero-touch login verified" : "Zero-touch login disabled"
-            );
+            RunHardwareOperation(delegate { controller.SetZeroTouchLogin(enabled); },
+                delegate
+                {
+                    zeroTouchLoginCheckBox.Checked = enabled;
+                    trayZeroTouchLogin.Checked = enabled;
+                },
+                "Updating zero-touch login...", enabled ? "Zero-touch login verified" : "Zero-touch login disabled", true);
         }
 
         private void ApplyZeroTouchLock(bool enabled)
         {
-            ApplyPresenceSetting(
-                enabled,
-                "Updating zero-touch lock...",
-                delegate { controller.SetZeroTouchLock(enabled); },
-                zeroTouchLockCheckBox,
-                trayZeroTouchLock,
-                enabled ? "Zero-touch lock verified" : "Zero-touch lock disabled"
-            );
+            RunHardwareOperation(delegate { controller.SetZeroTouchLock(enabled); },
+                delegate
+                {
+                    zeroTouchLockCheckBox.Checked = enabled;
+                    trayZeroTouchLock.Checked = enabled;
+                },
+                "Updating zero-touch lock...", enabled ? "Zero-touch lock verified" : "Zero-touch lock disabled", true);
         }
 
-        private void ApplyPresenceSetting(
-            bool enabled,
-            string progress,
-            Action apply,
-            ToggleSwitch toggle,
-            ToolStripMenuItem menuItem,
-            string success
-        )
+        private void DisplayState(LenovoState state)
         {
-            if (controller == null || updating) return;
+            UpdateModeButtons(state.PowerMode);
+            conservationCheckBox.Checked = state.ConservationMode;
+            trayConservation.Checked = state.ConservationMode;
+            zeroTouchLoginCheckBox.Checked = state.ZeroTouchLogin;
+            trayZeroTouchLogin.Checked = state.ZeroTouchLogin;
+            zeroTouchLockCheckBox.Checked = state.ZeroTouchLock;
+            trayZeroTouchLock.Checked = state.ZeroTouchLock;
+        }
+
+        private async void RunHardwareOperation(Action apply, Action displayVerified, string progress, string success, bool showErrors)
+        {
+            if (updating || exiting || IsDisposed || (apply != null && !hardwareAvailable)) return;
+            updating = true;
+            SetControlsEnabled(false);
+            statusLabel.Text = progress;
             try
             {
-                updating = true;
-                SetControlsEnabled(false);
-                statusLabel.Text = progress;
-                Application.DoEvents();
-                apply();
-                toggle.Checked = enabled;
-                menuItem.Checked = enabled;
-                statusLabel.Text = success;
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text = "Change failed";
-                ShowError(ex);
-                RefreshState(false);
+                LenovoState state = null;
+                Exception failure = null;
+                try
+                {
+                    state = await controllerWorker.Run(delegate
+                    {
+                        if (controller == null) controller = new LenovoController();
+                        if (apply != null)
+                        {
+                            apply();
+                            return null;
+                        }
+                        return controller.GetState();
+                    });
+                }
+                catch (Exception ex) { failure = ex; }
+                if (IsDisposed || exiting) return;
+                if (failure == null)
+                {
+                    if (apply == null) DisplayState(state); else displayVerified();
+                    hardwareAvailable = true;
+                    statusLabel.Text = success;
+                    if (apply == null) RefreshStartupState();
+                }
+                else
+                {
+                    hardwareAvailable = false;
+                    if (apply != null && controller != null)
+                    {
+                        try
+                        {
+                            LenovoState actual = await controllerWorker.Run(delegate { return controller.GetState(); });
+                            if (IsDisposed || exiting) return;
+                            DisplayState(actual);
+                            hardwareAvailable = true;
+                        }
+                        catch
+                        {
+                            // Leave hardware controls disabled until a refresh succeeds.
+                        }
+                    }
+                    if (IsDisposed || exiting) return;
+                    statusLabel.Text = apply == null ? "Lenovo control unavailable — use Refresh to retry" : "Change failed";
+                    connectionLabel.Text = hardwareAvailable ? "●  CONNECTED" : "●  UNAVAILABLE";
+                    connectionLabel.ForeColor = hardwareAvailable ? Color.FromArgb(91, 210, 145) : Muted;
+                    if (showErrors) ShowError(failure);
+                }
             }
             finally
             {
-                SetControlsEnabled(true);
                 updating = false;
+                if (!IsDisposed && !exiting)
+                {
+                    connectionLabel.Text = hardwareAvailable ? "●  CONNECTED" : "●  UNAVAILABLE";
+                    connectionLabel.ForeColor = hardwareAvailable ? Color.FromArgb(91, 210, 145) : Muted;
+                    SetControlsEnabled(true);
+                }
             }
         }
 
@@ -1165,13 +1275,22 @@ namespace LenovoQuickSettings
 
         private void SetControlsEnabled(bool enabled)
         {
-            autoButton.Enabled = enabled;
-            saverButton.Enabled = enabled;
-            performanceButton.Enabled = enabled;
-            conservationCheckBox.Enabled = enabled;
-            zeroTouchLoginCheckBox.Enabled = enabled;
-            zeroTouchLockCheckBox.Enabled = enabled;
+            bool hardwareEnabled = enabled && hardwareAvailable;
+            autoButton.Enabled = hardwareEnabled;
+            saverButton.Enabled = hardwareEnabled;
+            performanceButton.Enabled = hardwareEnabled;
+            conservationCheckBox.Enabled = hardwareEnabled;
+            zeroTouchLoginCheckBox.Enabled = hardwareEnabled;
+            zeroTouchLockCheckBox.Enabled = hardwareEnabled;
+            trayAuto.Enabled = hardwareEnabled;
+            traySaver.Enabled = hardwareEnabled;
+            trayPerformance.Enabled = hardwareEnabled;
+            trayConservation.Enabled = hardwareEnabled;
+            trayZeroTouchLogin.Enabled = hardwareEnabled;
+            trayZeroTouchLock.Enabled = hardwareEnabled;
             startupCheckBox.Enabled = enabled;
+            trayStartup.Enabled = enabled;
+            trayRefresh.Enabled = enabled;
         }
 
         private static string DisplayName(LenovoPowerMode mode)
@@ -1217,7 +1336,6 @@ namespace LenovoQuickSettings
         {
             exiting = true;
             trayIcon.Visible = false;
-            trayIcon.Dispose();
             Close();
         }
 
@@ -1271,7 +1389,12 @@ namespace LenovoQuickSettings
                 {
                     if (!startHidden)
                     {
-                        IntPtr existing = FindWindow(null, WindowTitle);
+                        IntPtr existing = IntPtr.Zero;
+                        for (int attempt = 0; attempt < 20 && existing == IntPtr.Zero; attempt++)
+                        {
+                            existing = FindWindow(null, WindowTitle);
+                            if (existing == IntPtr.Zero) Thread.Sleep(50);
+                        }
                         if (existing != IntPtr.Zero)
                         {
                             ShowWindow(existing, 9);
@@ -1289,69 +1412,125 @@ namespace LenovoQuickSettings
             return 0;
         }
 
-        private static int WriteStatusFile(string path)
+        private static int WriteReport(string path, Func<TextWriter, int> generate)
         {
             try
             {
-                LenovoController controller = new LenovoController();
-                LenovoState state = controller.GetState();
-                string report =
-                    "PowerMode=" + state.PowerMode + Environment.NewLine +
-                    "ConservationMode=" + state.ConservationMode + Environment.NewLine +
-                    "ZeroTouchLogin=" + state.ZeroTouchLogin + Environment.NewLine +
-                    "ZeroTouchLock=" + state.ZeroTouchLock + Environment.NewLine +
-                    "AddinDirectory=" + controller.AddinDirectory + Environment.NewLine;
-                File.WriteAllText(path, report);
-                return 0;
+                // Open the caller's path before Lenovo changes the process working directory.
+                using (StreamWriter writer = new StreamWriter(Path.GetFullPath(path), false))
+                {
+                    try { return generate(writer); }
+                    catch (Exception ex)
+                    {
+                        writer.WriteLine("ERROR=" + ex);
+                        return 1;
+                    }
+                }
             }
             catch (Exception ex)
             {
-                File.WriteAllText(path, "ERROR=" + ex + Environment.NewLine);
+                Console.Error.WriteLine("Could not write diagnostic report: " + ex.Message);
                 return 1;
             }
         }
 
+        private static int WriteStatusFile(string path)
+        {
+            return WriteReport(path, delegate(TextWriter writer)
+            {
+                using (LenovoController controller = new LenovoController())
+                {
+                    LenovoState state = controller.GetState();
+                    writer.WriteLine("PowerMode=" + state.PowerMode);
+                    writer.WriteLine("ConservationMode=" + state.ConservationMode);
+                    writer.WriteLine("ChargeMode=" + state.ChargeMode);
+                    writer.WriteLine("ZeroTouchLogin=" + state.ZeroTouchLogin);
+                    writer.WriteLine("ZeroTouchLock=" + state.ZeroTouchLock);
+                    writer.WriteLine("AddinDirectory=" + controller.AddinDirectory);
+                    return 0;
+                }
+            });
+        }
+
         private static int RunVerificationCycle(string path)
         {
-            StringBuilder report = new StringBuilder();
-            LenovoController controller = null;
-            LenovoState original = null;
-            try
+            return WriteReport(path, delegate(TextWriter writer)
             {
-                controller = new LenovoController();
-                original = controller.GetState();
-                report.AppendLine("OriginalPowerMode=" + original.PowerMode);
-                report.AppendLine("OriginalConservationMode=" + original.ConservationMode);
-                report.AppendLine("OriginalZeroTouchLogin=" + original.ZeroTouchLogin);
-                report.AppendLine("OriginalZeroTouchLock=" + original.ZeroTouchLock);
-
-                LenovoPowerMode testPower = original.PowerMode == LenovoPowerMode.BatterySaver
-                    ? LenovoPowerMode.Auto
-                    : LenovoPowerMode.BatterySaver;
-                controller.SetPowerMode(testPower);
-                report.AppendLine("TestPowerModeVerified=" + controller.GetState().PowerMode);
-                controller.SetPowerMode(original.PowerMode);
-                report.AppendLine("RestoredPowerMode=" + controller.GetState().PowerMode);
-
-                controller.SetConservationMode(!original.ConservationMode);
-                report.AppendLine("TestConservationModeVerified=" + controller.GetState().ConservationMode);
-                controller.SetConservationMode(original.ConservationMode);
-                report.AppendLine("RestoredConservationMode=" + controller.GetState().ConservationMode);
-                report.AppendLine("RESULT=PASS");
-                File.WriteAllText(path, report.ToString());
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                report.AppendLine("ERROR=" + ex);
-                if (controller != null && original != null)
+                int result = 0;
+                StringBuilder report = new StringBuilder();
+                try
                 {
-                    try { controller.SetPowerMode(original.PowerMode); } catch (Exception restoreEx) { report.AppendLine("POWER_RESTORE_ERROR=" + restoreEx); }
-                    try { controller.SetConservationMode(original.ConservationMode); } catch (Exception restoreEx) { report.AppendLine("CHARGING_RESTORE_ERROR=" + restoreEx); }
+                    using (LenovoController controller = new LenovoController())
+                    {
+                        LenovoState original = null;
+                        bool powerAttempted = false;
+                        bool chargingAttempted = false;
+                        try
+                        {
+                            original = controller.GetState();
+                            report.AppendLine("OriginalPowerMode=" + original.PowerMode);
+                            report.AppendLine("OriginalConservationMode=" + original.ConservationMode);
+                            report.AppendLine("OriginalChargeMode=" + original.ChargeMode);
+                            report.AppendLine("OriginalZeroTouchLogin=" + original.ZeroTouchLogin);
+                            report.AppendLine("OriginalZeroTouchLock=" + original.ZeroTouchLock);
+
+                            LenovoPowerMode testPower = original.PowerMode == LenovoPowerMode.BatterySaver
+                                ? LenovoPowerMode.Auto : LenovoPowerMode.BatterySaver;
+                            powerAttempted = true;
+                            controller.SetPowerMode(testPower);
+                            report.AppendLine("TestPowerModeVerified=" + testPower);
+                            chargingAttempted = true;
+                            controller.SetConservationMode(!original.ConservationMode);
+                            report.AppendLine("TestConservationModeVerified=" + !original.ConservationMode);
+                        }
+                        catch (Exception ex)
+                        {
+                            result = 1;
+                            report.AppendLine("ERROR=" + ex);
+                        }
+                        finally
+                        {
+                            // A setter can change hardware and then throw during verification.
+                            // Attempt each restore independently, even if the other restore fails.
+                            if (powerAttempted)
+                            {
+                                try
+                                {
+                                    controller.SetPowerMode(original.PowerMode);
+                                    report.AppendLine("RestoredPowerMode=" + original.PowerMode);
+                                }
+                                catch (Exception ex)
+                                {
+                                    result = 1;
+                                    report.AppendLine("POWER_RESTORE_ERROR=" + ex);
+                                }
+                            }
+                            if (chargingAttempted)
+                            {
+                                try
+                                {
+                                    controller.SetChargeMode(original.ChargeMode);
+                                    report.AppendLine("RestoredConservationMode=" + original.ConservationMode);
+                                    report.AppendLine("RestoredChargeMode=" + original.ChargeMode);
+                                }
+                                catch (Exception ex)
+                                {
+                                    result = 1;
+                                    report.AppendLine("CHARGING_RESTORE_ERROR=" + ex);
+                                }
+                            }
+                        }
+                    }
                 }
-                File.WriteAllText(path, report.ToString());
-                return 1;
-            }
+                catch (Exception ex)
+                {
+                    result = 1;
+                    report.AppendLine("ERROR=" + ex);
+                }
+                report.AppendLine(result == 0 ? "RESULT=PASS" : "RESULT=FAIL");
+                writer.Write(report.ToString());
+                return result;
+            });
         }
     }
 }
