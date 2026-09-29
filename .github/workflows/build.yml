@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -24,19 +26,73 @@ jobs:
         shell: powershell
         run: .\LenovoQuickSettings\build.ps1
 
-      - name: Verify build output
+      - name: Verify build output and prepare release notes
         shell: powershell
         run: |
           $exe = '.\LenovoQuickSettings\dist\LenovoQuickSettings.exe'
           if (-not (Test-Path -LiteralPath $exe)) {
               throw "Build output was not created at $exe"
           }
+          [xml]$manifest = Get-Content -LiteralPath '.\LenovoQuickSettings\app.manifest' -Raw
+          $version = [Version]$manifest.assembly.assemblyIdentity.version
+          $tag = "v$($version.ToString(3))"
+          $metadata = (Get-Item -LiteralPath $exe).VersionInfo
+          if ($metadata.FileVersion -ne $version.ToString() -or
+              $metadata.ProductVersion -ne $version.ToString(3) -or
+              [Reflection.AssemblyName]::GetAssemblyName((Resolve-Path $exe).Path).Version -ne $version) {
+              throw 'Executable version does not match the application manifest.'
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne $tag) {
+              throw "Release tag $env:GITHUB_REF_NAME does not match application version $tag"
+          }
+          $readme = Get-Content -LiteralPath '.\README.md' -Raw
+          $pattern = '(?ms)^### ' + [regex]::Escape($tag) + '\r?\n(?<notes>.*?)(?=^#{1,3} |\z)'
+          $entry = [regex]::Match($readme, $pattern)
+          if (-not $entry.Success -or [string]::IsNullOrWhiteSpace($entry.Groups['notes'].Value)) {
+              throw "README changelog is missing an entry for $tag"
+          }
+          $entry.Groups['notes'].Value.Trim() | Set-Content -LiteralPath '.\LenovoQuickSettings\dist\release-notes.md' -Encoding UTF8
           Get-Item -LiteralPath $exe | Format-List Name, Length, LastWriteTimeUtc
 
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:
           name: LenovoQuickSettings-windows-x64
-          path: LenovoQuickSettings/dist/LenovoQuickSettings.exe
+          path: |
+            LenovoQuickSettings/dist/LenovoQuickSettings.exe
+            LenovoQuickSettings/dist/release-notes.md
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified executable and release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: LenovoQuickSettings-windows-x64
+          path: dist
+
+      - name: Publish executable and changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/LenovoQuickSettings.exe --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "Lenovo Quick Settings $GITHUB_REF_NAME" \
+              --notes-file dist/release-notes.md --draft=false --latest
+          else
+            gh release create "$GITHUB_REF_NAME" dist/LenovoQuickSettings.exe \
+              --verify-tag --title "Lenovo Quick Settings $GITHUB_REF_NAME" \
+              --notes-file dist/release-notes.md --latest
+          fi

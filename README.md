@@ -26,7 +26,13 @@ The app calls the same installed Lenovo controller agents used by Vantage and ve
 
 The panel never creates a taskbar button. Closing or minimizing it hides it in the notification tray; left-click the tray icon to reopen the panel, or right-click it for direct controls.
 
-## Download a GitHub Actions build
+## Download
+
+Download **[LenovoQuickSettings.exe](https://github.com/jspann21/lenovo-quick-settings/releases/latest/download/LenovoQuickSettings.exe)** from the [latest release](https://github.com/jspann21/lenovo-quick-settings/releases/latest).
+
+The executable is a personal, unsigned Windows utility, so Windows may display a SmartScreen warning after downloading it.
+
+### Development builds
 
 1. Open the repository's **Actions** tab.
 2. Select **Build Windows executable**.
@@ -34,7 +40,17 @@ The panel never creates a taskbar button. Closing or minimizing it hides it in t
 4. Download the **LenovoQuickSettings-windows-x64** artifact.
 5. Extract `LenovoQuickSettings.exe` from the downloaded ZIP.
 
-The executable is a personal, unsigned Windows utility, so Windows may display a SmartScreen warning after downloading it.
+## Changelog
+
+### v1.1.0
+
+- Keep the panel and tray responsive while Lenovo hardware requests run in the background, with Refresh recovery when controls are unavailable.
+- Improve diagnostic reports and verification cleanup, including restoration of the original Quick charging mode.
+- Harden installation and removal, and publish a versioned Windows EXE automatically with each release.
+
+### v1.0.0
+
+- Initial release with tray controls for power, conservation charging, presence detection, and Windows startup.
 
 ## Build locally
 
@@ -51,6 +67,8 @@ LenovoQuickSettings\dist\LenovoQuickSettings.exe
 ```
 
 No Lenovo binaries are copied into the repository or bundled into the executable. Lenovo's installed Vantage add-ins are discovered at runtime.
+
+The version in `LenovoQuickSettings/app.manifest` is also embedded in the EXE's file and product metadata. To publish a release, update that version and the changelog above, then push a matching `vMAJOR.MINOR.PATCH` tag. GitHub Actions verifies the version, builds the EXE, and publishes it with the matching changelog entry on the [releases page](https://github.com/jspann21/lenovo-quick-settings/releases).
 
 Hardware requests run serially on a background STA thread so the panel and tray remain responsive. If Lenovo controls are unavailable, use **Refresh** in the tray menu to retry; Windows startup settings remain accessible. Failed changes are read back before hardware controls are re-enabled.
 
